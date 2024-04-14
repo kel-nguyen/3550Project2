@@ -7,6 +7,8 @@ import json
 import jwt
 import datetime
 import sqlite3
+import uuid
+from argon2 import PasswordHasher
 
 hostName = "localhost"
 serverPort = 8080
@@ -32,17 +34,6 @@ expired_pem = expired_key.private_bytes(
 )
 
 numbers = private_key.private_numbers()
-
-sql = '''INSTERT INTO keys(key, key, exp)
-            VALUES(?, ?, ?)'''
-
-    conn = sqlite3.connect('totally_not_my_privateKeys.db')
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS keys(kid INTEGER PRIMARY KEY AUTOINCREMENT, key BLOB NOT NULL, exp INTEGER NOT NULL)")
-    conn.commit()
-    return cur.lastrowid
-
-
 
 def int_to_base64(value):
     """Convert an integer to a Base64URL-encoded string"""
@@ -78,8 +69,62 @@ class MyServer(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed_path = urlparse(self.path)
+        if parsed_path.path == "/register":
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            user_data = json.loads(post_data.decode('utf-8'))
+
+            #generate secure UUIDv4 password
+            password = str(uuid.uuid4())
+            ph = PasswordHasher()
+            password_hash = ph.hash(password)
+
+            #connect to the database and store the user details
+            conn = sqlite3.connect('users.db')
+            cur = conn.cursor()
+            try: 
+                cur.execute("INSERT INTO users(username, password_hash, email) VALUES (?, ?, ?)",
+                (user_data['username'], password_hash, user_data['email']))
+                conn.commit()
+                self.send_response(201) #created
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                response = {"password": password}
+                self.wfile.write(bytes(json.dumps(response), "utf-8"))
+            except sqlite3.IntegrityError as e:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(bytes(json.dumps({"error": "Username or email already exists."}), "utf-8"))
+            finally:
+                conn.close()
+            return
         params = parse_qs(parsed_path.query)
-        if parsed_path.path == "/auth":
+        elif parsed_path.path == "/auth":
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            auth_data = json.loads(post_data.decode('utf-8'))
+            conn = sqlite3.connect('users.db')
+            cur = conn.cursor()
+            try: 
+                #retrieve user ID
+                cur.execute("SELECT id FROM users WHERE username = ?", (auth_data['username'],))
+                user_id = cur.fetchone()
+                if user_id:
+                    user_id = user_id[0]
+                    #Log the request to auth_logs
+                    cur.execute("INSERT INTO auth_logs(request_ip, user_id VALUES (?, ?)",
+                    (self.client_address[0], user_id))
+                    conn.commit()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(bytes(json.dumps({"status: Authentication logged"}), "utf-8"))
+                else: 
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(bytes(json.dumps({"error": "User not found"}), "utf-8"))
+            finally:
+                conn.close()
+                return
             headers = {
                 "kid": "goodKID"
             }
@@ -126,6 +171,30 @@ class MyServer(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    conn = sqlite3.connect('users.db')
+    cur = conn.cursor()
+    cur.execute("""
+         CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            email TEXT UNIQUE,
+            date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS auth_logs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_ip TEXT NOT NULL,
+            request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            user_id INTEGER,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
     webServer = HTTPServer((hostName, serverPort), MyServer)
     try:
         webServer.serve_forever()
@@ -133,4 +202,5 @@ if __name__ == "__main__":
         pass
 
     webServer.server_close()
+    print("Server stopped.")
 
